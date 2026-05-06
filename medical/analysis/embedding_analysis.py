@@ -76,18 +76,37 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Medical-domain token groups (Table 1 equivalent)
 # ---------------------------------------------------------------------------
+# Words are selected from the MIMIC-IV val set to cover a frequency spectrum
+# that mirrors the four groups in the original HypLoRA paper:
+#   Group 1 – high-frequency function words  (freq > 100 in val)
+#   Group 2 – common clinical/EHR terms      (freq 50–10000)
+#   Group 3 – general laboratory concepts    (freq 20–1000)
+#   Group 4 – specific drug / rare lab names (freq < 30)
 MEDICAL_GROUPS = {
     "Group 1 (function words)": [
-        "the", "is", "of", "and", "in", "to", "a",
+        # Freq in val: the=145, of=347, and=170, to=135, for=134, by=133, with=57
+        "the", "of", "and", "to", "for", "by", "with", "is", "are", "been",
     ],
     "Group 2 (clinical common)": [
-        "patient", "blood", "mg", "day", "history",
+        # Freq in val: blood=10891, mg=1395, insulin=1209, sodium=849,
+        # hematocrit=602, glucose=588, chloride=516, administered=5239
+        "blood", "mg", "insulin", "sodium", "hematocrit",
+        "glucose", "chloride", "administered", "laboratory", "emar",
     ],
     "Group 3 (general medical)": [
-        "glucose", "sodium", "hemoglobin", "creatinine", "platelet",
+        # Freq in val: phosphate=218, fibrinogen=217, hemoglobin=142,
+        # calcium=132, bicarbonate=123, magnesium=122, platelet=121,
+        # bilirubin=82, potassium=48, albumin=38
+        "phosphate", "hemoglobin", "calcium", "bicarbonate",
+        "magnesium", "platelet", "bilirubin", "potassium", "albumin",
     ],
     "Group 4 (specific clinical)": [
-        "administered", "hematocrit", "fibrinogen", "aripiprazole", "phytonadione",
+        # Freq in val: aripiprazole=582(*), phytonadione=136, fibrinogen=217(*),
+        # enoxaparin=26, creatinine=27, furosemide=13, gabapentin=14,
+        # prednisone=6, budesonide=10
+        # (*) higher than expected due to small val size; full dataset will differ
+        "phytonadione", "enoxaparin", "creatinine", "furosemide",
+        "gabapentin", "prednisone", "budesonide", "tramadol", "loratadine",
     ],
 }
 
@@ -541,6 +560,12 @@ def main():
                         help="Number of concurrent /v1/embeddings requests in API mode "
                              "(default: 1 = sequential). Increase to e.g. 16 to reduce "
                              "wall-clock time when API latency is the bottleneck.")
+    parser.add_argument("--tables", default="all",
+                        choices=["1", "2", "all"],
+                        help="Which tables to reproduce: '1' = token norm analysis only, "
+                             "'2' = delta-hyperbolicity only, 'all' = both (default: all). "
+                             "Selecting '1' skips the O(n^3) delta computation; "
+                             "selecting '2' still collects token stats but skips Table 1 output.")
     args = parser.parse_args()
 
     if not args.api_mode and not args.base_model:
@@ -602,6 +627,9 @@ def main():
         model.eval()
         embedding_cache = None
 
+    run_table1 = args.tables in ("1", "all")
+    run_table2 = args.tables in ("2", "all")
+
     # ------------------------------------------------------------------
     # Main loop: token statistics (Table 1) + delta-hyperbolicity (Table 2)
     # ------------------------------------------------------------------
@@ -609,7 +637,8 @@ def main():
     token_norms:     dict[str, list[float]] = defaultdict(list)
     delta_ratios:    list[float]            = []
 
-    print(f"\nAnalysing {len(samples)} samples (text_field='{args.text_field}')...")
+    skip_delta_msg = "" if run_table2 else " (delta skipped: --tables=1)"
+    print(f"\nAnalysing {len(samples)} samples (text_field='{args.text_field}'){skip_delta_msg}...")
     for sample in tqdm(samples, desc="Embedding analysis"):
         text = extract_text(sample, args.text_field)
         if not text.strip():
@@ -630,14 +659,15 @@ def main():
             with torch.no_grad():
                 embeddings = model.get_input_embeddings()(input_ids)  # (1, seq_len, hidden)
 
-        # Table 1: accumulate token statistics
+        # Table 1: accumulate token statistics (always needed for CSV/JSON)
         norms = compute_norms(embeddings)
         accumulate_token_stats(tokenizer, input_ids, norms, token_frequency, token_norms)
 
-        # Table 2: delta-hyperbolicity
-        delta, diam = get_delta(embeddings, max_points=args.max_points)
-        if diam > 0:
-            delta_ratios.append(2.0 * delta / diam)
+        # Table 2: delta-hyperbolicity (skip if --tables=1)
+        if run_table2:
+            delta, diam = get_delta(embeddings, max_points=args.max_points)
+            if diam > 0:
+                delta_ratios.append(2.0 * delta / diam)
 
     # Print API usage summary if applicable
     if args.api_mode and lm.usage:
@@ -647,34 +677,37 @@ def main():
     # Table 1: group statistics
     # ------------------------------------------------------------------
     group_stats = compute_group_stats(MEDICAL_GROUPS, token_frequency, token_norms)
-    print_table1(group_stats, model_name)
+    if run_table1:
+        print_table1(group_stats, model_name)
 
     # ------------------------------------------------------------------
     # Table 2: delta-hyperbolicity summary
     # ------------------------------------------------------------------
-    print_table2(delta_ratios, model_name, dataset_name)
+    if run_table2:
+        print_table2(delta_ratios, model_name, dataset_name)
 
     # ------------------------------------------------------------------
     # Save outputs
     # ------------------------------------------------------------------
     prefix = f"{model_name}_{dataset_name}_{args.text_field}"
 
-    # Figure 1 equivalent
-    plot_frequency_vs_norm(
-        token_frequency, token_norms,
-        output_path=os.path.join(args.output_dir, f"{prefix}_freq_vs_norm.png"),
-        dataset_name=f"{dataset_name} ({args.text_field})",
-    )
+    # Figure 1 equivalent (only if Table 1 was run)
+    if run_table1:
+        plot_frequency_vs_norm(
+            token_frequency, token_norms,
+            output_path=os.path.join(args.output_dir, f"{prefix}_freq_vs_norm.png"),
+            dataset_name=f"{dataset_name} ({args.text_field})",
+        )
 
-    # Delta distribution histogram
-    if delta_ratios:
+    # Delta distribution histogram (only if Table 2 was run)
+    if run_table2 and delta_ratios:
         plot_delta_distribution(
             delta_ratios,
             output_path=os.path.join(args.output_dir, f"{prefix}_delta_hist.png"),
             dataset_name=f"{dataset_name} ({args.text_field})",
         )
 
-    # Token statistics CSV
+    # Token statistics CSV (always saved; useful for both tables)
     save_csv(
         token_frequency, token_norms,
         output_path=os.path.join(args.output_dir, f"{prefix}_token_stats.csv"),
