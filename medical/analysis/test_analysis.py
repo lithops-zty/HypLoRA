@@ -133,8 +133,18 @@ class MockLMCompletion:
 mock_lm = MockLMCompletion()
 
 # build_embedding_cache should collect unique tokens and call embed()
+# Test sequential mode
 api_cache = build_embedding_cache(
-    samples, tokenizer, "all", mock_lm, "mock-embed-model", embed_batch_size=100
+    samples, tokenizer, "all", mock_lm, "mock-embed-model",
+    embed_batch_size=10, parallel_workers=1,
+)
+assert len(api_cache) > 0, "Sequential API cache is empty"
+print(f"[OK] build_embedding_cache (sequential): {len(api_cache)} tokens")
+
+# Test parallel mode (workers=4, smaller batches to exercise multiple futures)
+api_cache = build_embedding_cache(
+    samples, tokenizer, "all", mock_lm, "mock-embed-model",
+    embed_batch_size=5, parallel_workers=4,
 )
 assert len(api_cache) > 0, "API cache is empty"
 first_vec = next(iter(api_cache.values()))

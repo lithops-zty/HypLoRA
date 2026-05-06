@@ -59,6 +59,7 @@ import numpy as np
 import torch
 from scipy.spatial import distance_matrix as scipy_distance_matrix
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -388,23 +389,12 @@ def save_results_json(
 # API mode: build token embedding cache via LMCompletion.embed()
 # ---------------------------------------------------------------------------
 
-def build_embedding_cache(
+def _collect_unique_tokens(
     samples: list[dict],
     tokenizer,
     text_field: str,
-    lm: "LMCompletion",
-    embed_model: str,
-    embed_batch_size: int,
-) -> dict[str, list[float]]:
-    """
-    Collect all unique token strings across all samples, embed them in batches
-    via the /v1/embeddings endpoint, and return a {token_str: vector} cache.
-
-    Each token is embedded in isolation (single-token input), which closely
-    approximates the static input-embedding-matrix lookup used in the original
-    HypLoRA paper.
-    """
-    print("Collecting unique tokens across all samples...")
+) -> list[str]:
+    """Tokenise all samples and return a sorted list of unique token strings."""
     unique_tokens: set[str] = set()
     for sample in tqdm(samples, desc="Tokenising for cache"):
         text = extract_text(sample, text_field)
@@ -416,15 +406,74 @@ def build_embedding_cache(
             cleaned = clean_token(t)
             if cleaned:
                 unique_tokens.add(cleaned)
+    return sorted(unique_tokens)
 
-    token_list = sorted(unique_tokens)
+
+def build_embedding_cache(
+    samples: list[dict],
+    tokenizer,
+    text_field: str,
+    lm: "LMCompletion",
+    embed_model: str,
+    embed_batch_size: int,
+    parallel_workers: int = 1,
+) -> dict[str, list[float]]:
+    """
+    Collect all unique token strings across all samples, embed them in batches
+    via the /v1/embeddings endpoint, and return a {token_str: vector} cache.
+
+    Each token is embedded in isolation (single-token input), which closely
+    approximates the static input-embedding-matrix lookup used in the original
+    HypLoRA paper.
+
+    Args:
+        parallel_workers: Number of concurrent API requests. 1 = sequential
+                          (default). >1 enables parallel mode via
+                          ThreadPoolExecutor, which significantly reduces
+                          wall-clock time when the API has high per-request
+                          latency.
+    """
+    print("Collecting unique tokens across all samples...")
+    token_list = _collect_unique_tokens(samples, tokenizer, text_field)
     print(f"Unique tokens to embed: {len(token_list)}")
 
-    print(f"Fetching embeddings from API (model={embed_model}, batch_size={embed_batch_size})...")
-    vectors = []
-    for i in tqdm(range(0, len(token_list), embed_batch_size), desc="Embedding batches"):
-        batch = token_list[i: i + embed_batch_size]
-        vectors.extend(lm.embed(batch, model=embed_model))
+    # Split into batches
+    batches = [
+        (i, token_list[i: i + embed_batch_size])
+        for i in range(0, len(token_list), embed_batch_size)
+    ]
+    n_batches = len(batches)
+
+    if parallel_workers <= 1:
+        # Sequential path (original behaviour)
+        print(f"Fetching embeddings from API "
+              f"(model={embed_model}, batch_size={embed_batch_size}, sequential)...")
+        results: dict[int, list[list[float]]] = {}
+        for i, batch in tqdm(batches, desc="Embedding batches", total=n_batches):
+            results[i] = lm.embed(batch, model=embed_model)
+    else:
+        # Parallel path
+        print(f"Fetching embeddings from API "
+              f"(model={embed_model}, batch_size={embed_batch_size}, "
+              f"workers={parallel_workers})...")
+
+        def _fetch(idx_batch):
+            idx, batch = idx_batch
+            return idx, lm.embed(batch, model=embed_model)
+
+        results: dict[int, list[list[float]]] = {}
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            futures = {executor.submit(_fetch, b): b[0] for b in batches}
+            with tqdm(total=n_batches, desc="Embedding batches") as pbar:
+                for future in as_completed(futures):
+                    idx, vecs = future.result()  # re-raises exceptions from threads
+                    results[idx] = vecs
+                    pbar.update(1)
+
+    # Reassemble in original order
+    vectors: list[list[float]] = []
+    for i, _ in batches:
+        vectors.extend(results[i])
 
     cache = {token_list[i]: vectors[i] for i in range(len(token_list))}
     print(f"Embedding cache built: {len(cache)} entries, dim={len(next(iter(cache.values())))}")
@@ -488,6 +537,10 @@ def main():
                         help="API base URL (falls back to OPENAI_BASE_URL env var)")
     parser.add_argument("--embed_batch_size", default=512, type=int,
                         help="Number of tokens per /v1/embeddings request (default: 512)")
+    parser.add_argument("--parallel_workers", default=1, type=int,
+                        help="Number of concurrent /v1/embeddings requests in API mode "
+                             "(default: 1 = sequential). Increase to e.g. 16 to reduce "
+                             "wall-clock time when API latency is the bottleneck.")
     args = parser.parse_args()
 
     if not args.api_mode and not args.base_model:
@@ -532,7 +585,8 @@ def main():
             track_usage=True,
         )
         embedding_cache = build_embedding_cache(
-            samples, tokenizer, args.text_field, lm, args.embed_model, args.embed_batch_size
+            samples, tokenizer, args.text_field, lm, args.embed_model,
+            args.embed_batch_size, args.parallel_workers,
         )
         model = None
         device = "cpu"
