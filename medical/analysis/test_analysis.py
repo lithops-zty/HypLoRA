@@ -26,6 +26,8 @@ from medical.analysis.embedding_analysis import (
     plot_delta_distribution,
     save_csv,
     save_results_json,
+    build_embedding_cache,
+    embeddings_from_cache,
 )
 from collections import defaultdict
 
@@ -106,5 +108,63 @@ with tempfile.TemporaryDirectory() as tmpdir:
         r = json.load(f)
     assert "table1_group_stats" in r and "table2_delta_hyperbolicity" in r
     print(f"[OK] All output files generated successfully")
+
+# ── 7. API mode mock test ────────────────────────────────────────────────────
+print("\n--- Testing API mode (mock LMCompletion.embed) ---")
+
+HIDDEN_API = 1536  # typical OpenAI embedding dim
+
+class MockLMCompletion:
+    """Minimal mock that satisfies LMCompletion.embed() interface."""
+    def __init__(self):
+        self.usage = {"prompt_tokens": 0, "total_tokens": 0}
+
+    def embed(self, texts, model=None, **kwargs):
+        # Return a random unit vector for each text
+        vecs = []
+        for _ in texts:
+            v = np.random.randn(HIDDEN_API).astype(np.float32)
+            v /= (np.linalg.norm(v) + 1e-9)
+            vecs.append(v.tolist())
+        self.usage["prompt_tokens"] += len(texts)
+        self.usage["total_tokens"]  += len(texts)
+        return vecs
+
+mock_lm = MockLMCompletion()
+
+# build_embedding_cache should collect unique tokens and call embed()
+api_cache = build_embedding_cache(
+    samples, tokenizer, "all", mock_lm, "mock-embed-model", embed_batch_size=100
+)
+assert len(api_cache) > 0, "API cache is empty"
+first_vec = next(iter(api_cache.values()))
+assert len(first_vec) == HIDDEN_API, f"Expected dim {HIDDEN_API}, got {len(first_vec)}"
+print(f"[OK] build_embedding_cache: {len(api_cache)} unique tokens, dim={HIDDEN_API}")
+
+# embeddings_from_cache should reconstruct a tensor from the cache
+api_token_frequency = defaultdict(int)
+api_token_norms     = defaultdict(list)
+api_delta_ratios    = []
+
+for sample in samples:
+    text = extract_text(sample, "all")
+    if not text.strip():
+        continue
+    ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"]
+    emb = embeddings_from_cache(tokenizer, ids, api_cache)
+    if emb is None:
+        continue
+    assert emb.dim() == 3, "Expected (1, seq_len, hidden) tensor"
+    assert emb.shape[2] == HIDDEN_API
+    norms = compute_norms(emb)
+    accumulate_token_stats(tokenizer, ids, norms, api_token_frequency, api_token_norms)
+    delta, diam = get_delta(emb, max_points=200)
+    if diam > 0:
+        api_delta_ratios.append(2.0 * delta / diam)
+
+assert len(api_delta_ratios) > 0, "No delta values computed in API mode"
+assert all(0.0 <= d <= 1.0 for d in api_delta_ratios)
+print(f"[OK] embeddings_from_cache: {len(api_delta_ratios)} delta values, "
+      f"mean={np.mean(api_delta_ratios):.4f}")
 
 print("\n=== All tests passed ===")
