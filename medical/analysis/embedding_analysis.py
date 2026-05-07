@@ -18,7 +18,7 @@ Table 2 equivalent: delta-hyperbolicity of per-sample token embeddings.
     normalises by diameter: delta_rel = 2*delta / diam
   - Reports mean ± std of delta_rel across all samples.
 
-Usage — local model:
+Usage:
     python medical/analysis/embedding_analysis.py \
         --data_path path/to/val.jsonl \
         --base_model Qwen/Qwen3-8B \
@@ -27,23 +27,14 @@ Usage — local model:
         [--max_samples 0]            # 0 = all samples
         [--max_points 1500]          # max tokens per sample for delta computation
         [--model_name Qwen3-8B]      # display name used in output filenames
+        [--group_llm_model gpt-4o-mini]  # LLM for Table 1 token grouping (API)
+        [--api_key sk-...]           # API key for --group_llm_model
+        [--api_base https://...]     # API base URL for --group_llm_model
 
-Usage — API mode (OpenAI-compatible /v1/embeddings):
-    python medical/analysis/embedding_analysis.py \
-        --data_path path/to/val.jsonl \
-        --base_model Qwen/Qwen3-8B \
-        --api_mode \
-        --embed_model text-embedding-3-small \
-        [--api_key sk-...] \
-        [--api_base https://api.openai.com/v1] \
-        [--embed_batch_size 512] \
-        [--output_dir medical/analysis/results]
-
-    In API mode, --base_model is used ONLY to load the tokenizer (no model
-    weights are loaded). The actual embedding vectors are fetched from the
-    /v1/embeddings endpoint via LMCompletion.embed(). Each unique token string
-    is embedded once and cached; the cache is reused across all samples.
-    OPENAI_API_KEY and OPENAI_BASE_URL environment variables are respected.
+    Embeddings are always extracted locally via the model's input embedding
+    matrix (no GPU forward pass needed beyond loading the embedding layer).
+    OPENAI_API_KEY and OPENAI_BASE_URL environment variables are respected
+    for the optional LLM-based token grouping call.
 """
 
 import argparse
@@ -59,7 +50,6 @@ import numpy as np
 import torch
 from scipy.spatial import distance_matrix as scipy_distance_matrix
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -165,9 +155,10 @@ def _stratified_sample(
 
 def select_groups_via_llm(
     token_frequency: dict[str, int],
-    lm: "LMCompletion",
     group_llm_model: str,
     vocab_sample_k: int = 600,
+    api_key: str = "",
+    api_base: str = "",
 ) -> dict[str, list[str]]:
     """
     Ask an LLM to select 20 representative tokens per group from a stratified
@@ -192,12 +183,10 @@ def select_groups_via_llm(
         "Select exactly 20 tokens per group."
     )
 
-    # Use a fresh LMCompletion instance with the grouping model to avoid
-    # polluting the conversation history of the embedding LM instance.
     grouping_lm = LMCompletion(
         model=group_llm_model,
-        api_key=lm.api_key,
-        request_url=lm.request_url,
+        api_key=api_key or None,
+        request_url=api_base or None,
         log_mode="none",
         track_usage=True,
     )
@@ -529,122 +518,6 @@ def save_results_json(
 
 
 # ---------------------------------------------------------------------------
-# API mode: build token embedding cache via LMCompletion.embed()
-# ---------------------------------------------------------------------------
-
-def _collect_unique_tokens(
-    samples: list[dict],
-    tokenizer,
-    text_field: str,
-) -> list[str]:
-    """Tokenise all samples and return a sorted list of unique token strings."""
-    unique_tokens: set[str] = set()
-    for sample in tqdm(samples, desc="Tokenising for cache"):
-        text = extract_text(sample, text_field)
-        if not text.strip():
-            continue
-        ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"]
-        tokens = tokenizer.convert_ids_to_tokens(ids.squeeze(0).numpy())
-        for t in tokens:
-            cleaned = clean_token(t)
-            if cleaned:
-                unique_tokens.add(cleaned)
-    return sorted(unique_tokens)
-
-
-def build_embedding_cache(
-    samples: list[dict],
-    tokenizer,
-    text_field: str,
-    lm: "LMCompletion",
-    embed_model: str,
-    embed_batch_size: int,
-    parallel_workers: int = 1,
-) -> dict[str, list[float]]:
-    """
-    Collect all unique token strings across all samples, embed them in batches
-    via the /v1/embeddings endpoint, and return a {token_str: vector} cache.
-
-    Each token is embedded in isolation (single-token input), which closely
-    approximates the static input-embedding-matrix lookup used in the original
-    HypLoRA paper.
-
-    Args:
-        parallel_workers: Number of concurrent API requests. 1 = sequential
-                          (default). >1 enables parallel mode via
-                          ThreadPoolExecutor, which significantly reduces
-                          wall-clock time when the API has high per-request
-                          latency.
-    """
-    print("Collecting unique tokens across all samples...")
-    token_list = _collect_unique_tokens(samples, tokenizer, text_field)
-    print(f"Unique tokens to embed: {len(token_list)}")
-
-    # Split into batches
-    batches = [
-        (i, token_list[i: i + embed_batch_size])
-        for i in range(0, len(token_list), embed_batch_size)
-    ]
-    n_batches = len(batches)
-
-    if parallel_workers <= 1:
-        # Sequential path (original behaviour)
-        print(f"Fetching embeddings from API "
-              f"(model={embed_model}, batch_size={embed_batch_size}, sequential)...")
-        results: dict[int, list[list[float]]] = {}
-        for i, batch in tqdm(batches, desc="Embedding batches", total=n_batches):
-            results[i] = lm.embed(batch, model=embed_model)
-    else:
-        # Parallel path
-        print(f"Fetching embeddings from API "
-              f"(model={embed_model}, batch_size={embed_batch_size}, "
-              f"workers={parallel_workers})...")
-
-        def _fetch(idx_batch):
-            idx, batch = idx_batch
-            return idx, lm.embed(batch, model=embed_model)
-
-        results: dict[int, list[list[float]]] = {}
-        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-            futures = {executor.submit(_fetch, b): b[0] for b in batches}
-            with tqdm(total=n_batches, desc="Embedding batches") as pbar:
-                for future in as_completed(futures):
-                    idx, vecs = future.result()  # re-raises exceptions from threads
-                    results[idx] = vecs
-                    pbar.update(1)
-
-    # Reassemble in original order
-    vectors: list[list[float]] = []
-    for i, _ in batches:
-        vectors.extend(results[i])
-
-    cache = {token_list[i]: vectors[i] for i in range(len(token_list))}
-    print(f"Embedding cache built: {len(cache)} entries, dim={len(next(iter(cache.values())))}")
-    return cache
-
-
-def embeddings_from_cache(
-    tokenizer,
-    input_ids: torch.Tensor,
-    cache: dict[str, list[float]],
-) -> torch.Tensor | None:
-    """
-    Reconstruct a (1, seq_len, hidden) float tensor from the embedding cache.
-    Tokens not found in the cache are skipped; returns None if no tokens match.
-    """
-    tokens = tokenizer.convert_ids_to_tokens(input_ids.squeeze(0).numpy())
-    rows = []
-    for t in tokens:
-        cleaned = clean_token(t)
-        if cleaned and cleaned in cache:
-            rows.append(cache[cleaned])
-    if not rows:
-        return None
-    arr = np.array(rows, dtype=np.float32)          # (n_found, hidden)
-    return torch.from_numpy(arr).unsqueeze(0)        # (1, n_found, hidden)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -664,53 +537,35 @@ def main():
     parser.add_argument("--max_points",  default=1500, type=int,
                         help="Max tokens per sample for delta computation (subsampled if exceeded)")
     parser.add_argument("--model_name",  default="",
-                        help="Display name for the model (defaults to base_model / embed_model basename)")
-    # ── local model ────────────────────────────────────────────────────────
-    parser.add_argument("--base_model",  default="",
-                        help="HuggingFace model name or local path. "
-                             "In API mode, used only for tokenizer loading.")
-    # ── API mode ───────────────────────────────────────────────────────────
-    parser.add_argument("--api_mode",    action="store_true",
-                        help="Use OpenAI-compatible /v1/embeddings API instead of local model")
-    parser.add_argument("--embed_model", default="text-embedding-3-small",
-                        help="Embedding model name for API mode (default: text-embedding-3-small)")
+                        help="Display name for the model (defaults to base_model basename)")
+    # ── local model ──────────────────────────────────────────────────────────────────────────────────
+    parser.add_argument("--base_model",  required=True,
+                        help="HuggingFace model name or local path")
+    # ── LLM grouping API (for --group_llm_model) ───────────────────────────────────────────────
     parser.add_argument("--api_key",     default="",
-                        help="API key (falls back to OPENAI_API_KEY env var)")
+                        help="API key for --group_llm_model (falls back to OPENAI_API_KEY env var)")
     parser.add_argument("--api_base",    default="",
-                        help="API base URL (falls back to OPENAI_BASE_URL env var)")
-    parser.add_argument("--embed_batch_size", default=512, type=int,
-                        help="Number of tokens per /v1/embeddings request (default: 512)")
-    parser.add_argument("--parallel_workers", default=1, type=int,
-                        help="Number of concurrent /v1/embeddings requests in API mode "
-                             "(default: 1 = sequential). Increase to e.g. 16 to reduce "
-                             "wall-clock time when API latency is the bottleneck.")
+                        help="API base URL for --group_llm_model (falls back to OPENAI_BASE_URL env var)")
     parser.add_argument("--tables", default="all",
                         choices=["1", "2", "all"],
                         help="Which tables to reproduce: '1' = token norm analysis only, "
                              "'2' = delta-hyperbolicity only, 'all' = both (default: all). "
                              "Selecting '1' skips the O(n^3) delta computation; "
                              "selecting '2' still collects token stats but skips Table 1 output.")
-    # -- Table 1 LLM grouping ------------------------------------------------
+    # ── Table 1 LLM grouping ──────────────────────────────────────────────────────────────────────────────────
     parser.add_argument("--group_llm_model", default="",
                         help="LLM model for Table 1 token group selection via API. "
-                             "Uses same api_base/api_key as embedding mode. "
+                             "Uses same --api_base/--api_key. "
                              "If empty, falls back to hard-coded MEDICAL_GROUPS_FALLBACK.")
     parser.add_argument("--vocab_sample_k", default=600, type=int,
                         help="Number of tokens to sample for LLM group selection (default: 600)")
     args = parser.parse_args()
 
-    if not args.api_mode and not args.base_model:
-        parser.error("--base_model is required in local mode")
-    if args.api_mode and LMCompletion is None:
-        parser.error("API mode requires the 'openai' package: pip install openai")
+    if LMCompletion is None and args.group_llm_model:
+        parser.error("--group_llm_model requires the 'openai' package: pip install openai")
 
     # Determine display name
-    if args.model_name:
-        model_name = args.model_name
-    elif args.api_mode:
-        model_name = os.path.basename(args.embed_model.rstrip("/"))
-    else:
-        model_name = os.path.basename(args.base_model.rstrip("/"))
+    model_name = args.model_name or os.path.basename(args.base_model.rstrip("/"))
 
     dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     os.makedirs(args.output_dir, exist_ok=True)
@@ -725,38 +580,20 @@ def main():
     print(f"Samples to process: {len(samples)}")
 
     # ------------------------------------------------------------------
-    # Load tokenizer (always needed) and optionally the model
+    # Load tokenizer and model
     # ------------------------------------------------------------------
     print(f"Loading tokenizer from: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
-    # API mode: build embedding cache; skip model loading entirely
-    if args.api_mode:
-        print(f"API mode: embedding model = {args.embed_model}")
-        lm = LMCompletion(
-            model=args.embed_model,
-            api_key=args.api_key or None,
-            request_url=args.api_base or None,
-            log_mode="none",
-            track_usage=True,
-        )
-        embedding_cache = build_embedding_cache(
-            samples, tokenizer, args.text_field, lm, args.embed_model,
-            args.embed_batch_size, args.parallel_workers,
-        )
-        model = None
-        device = "cpu"
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading model from: {args.base_model}  (device={device})")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.base_model,
-            torch_dtype=torch.float16,
-            device_map={"":  int(os.environ.get("LOCAL_RANK") or 0)} if device == "cuda" else "cpu",
-            trust_remote_code=True,
-        )
-        model.eval()
-        embedding_cache = None
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading model from: {args.base_model}  (device={device})")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        torch_dtype=torch.float16,
+        device_map={"":  int(os.environ.get("LOCAL_RANK") or 0)} if device == "cuda" else "cpu",
+        trust_remote_code=True,
+    )
+    model.eval()
 
     run_table1 = args.tables in ("1", "all")
     run_table2 = args.tables in ("2", "all")
@@ -781,14 +618,9 @@ def main():
             truncation=False,
         )["input_ids"]  # keep on CPU; moved to device below if needed
 
-        if args.api_mode:
-            embeddings = embeddings_from_cache(tokenizer, input_ids, embedding_cache)
-            if embeddings is None:
-                continue
-        else:
-            input_ids = input_ids.to(device)
-            with torch.no_grad():
-                embeddings = model.get_input_embeddings()(input_ids)  # (1, seq_len, hidden)
+        input_ids = input_ids.to(device)
+        with torch.no_grad():
+            embeddings = model.get_input_embeddings()(input_ids)  # (1, seq_len, hidden)
 
         # Table 1: accumulate token statistics (always needed for CSV/JSON)
         norms = compute_norms(embeddings)
@@ -800,22 +632,19 @@ def main():
             if diam > 0:
                 delta_ratios.append(2.0 * delta / diam)
 
-    # Print API usage summary if applicable
-    if args.api_mode and lm.usage:
-        print(f"\nAPI usage: {lm.usage['total_tokens']} total tokens")
-
     # ------------------------------------------------------------------
     # Table 1: group statistics
     # ------------------------------------------------------------------
     if run_table1:
-        if args.group_llm_model and args.api_mode and lm is not None:
+        if args.group_llm_model:
             medical_groups = select_groups_via_llm(
-                token_frequency, lm, args.group_llm_model, args.vocab_sample_k
+                token_frequency,
+                args.group_llm_model,
+                vocab_sample_k=args.vocab_sample_k,
+                api_key=args.api_key,
+                api_base=args.api_base,
             )
         else:
-            if args.group_llm_model and not args.api_mode:
-                print("WARNING: --group_llm_model requires --api_mode. "
-                      "Falling back to MEDICAL_GROUPS_FALLBACK.")
             medical_groups = MEDICAL_GROUPS_FALLBACK
         group_stats = compute_group_stats(medical_groups, token_frequency, token_norms)
         print_table1(group_stats, model_name)

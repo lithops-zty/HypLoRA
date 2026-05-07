@@ -18,7 +18,6 @@ from medical.analysis.embedding_analysis import (
     compute_group_stats,
     delta_hyp,
     get_delta,
-    compute_group_stats,
     MEDICAL_GROUPS_FALLBACK,
     print_table1,
     print_table2,
@@ -26,8 +25,6 @@ from medical.analysis.embedding_analysis import (
     plot_delta_distribution,
     save_csv,
     save_results_json,
-    build_embedding_cache,
-    embeddings_from_cache,
 )
 from collections import defaultdict
 
@@ -109,72 +106,53 @@ with tempfile.TemporaryDirectory() as tmpdir:
     assert "table1_group_stats" in r and "table2_delta_hyperbolicity" in r
     print(f"[OK] All output files generated successfully")
 
-# ── 7. API mode mock test ────────────────────────────────────────────────────
-print("\n--- Testing API mode (mock LMCompletion.embed) ---")
+# ── 7. LLM grouping mock test ────────────────────────────────────────────────
+print("\n--- Testing LLM-based Table 1 grouping (mock LMCompletion) ---")
 
-HIDDEN_API = 1536  # typical OpenAI embedding dim
+from medical.analysis.embedding_analysis import select_groups_via_llm
 
-class MockLMCompletion:
-    """Minimal mock that satisfies LMCompletion.embed() interface."""
-    def __init__(self):
-        self.usage = {"prompt_tokens": 0, "total_tokens": 0}
+# Patch LMCompletion inside embedding_analysis to intercept the API call
+import medical.analysis.embedding_analysis as _ea
+import json as _json
+import unittest.mock as _mock
 
-    def embed(self, texts, model=None, **kwargs):
-        # Return a random unit vector for each text
-        vecs = []
-        for _ in texts:
-            v = np.random.randn(HIDDEN_API).astype(np.float32)
-            v /= (np.linalg.norm(v) + 1e-9)
-            vecs.append(v.tolist())
-        self.usage["prompt_tokens"] += len(texts)
-        self.usage["total_tokens"]  += len(texts)
-        return vecs
+def _mock_lm_init(self, model=None, api_key=None, request_url=None,
+                  log_mode="none", track_usage=False):
+    self.model = model
+    self.usage = {"prompt_tokens": 0, "total_tokens": 0}
+    self._history = []
 
-mock_lm = MockLMCompletion()
+def _mock_lm_call(self, prompt, role="user", temperature=1.0, **kwargs):
+    if role == "system":
+        self._history.append({"role": "system", "content": prompt})
+        return ""
+    # Build a minimal 4-group response using the first tokens seen
+    all_tokens = list(token_frequency.keys())
+    n = len(all_tokens)
+    chunk = max(1, n // 4)
+    groups = {
+        "group1": all_tokens[:chunk],
+        "group2": all_tokens[chunk:2*chunk],
+        "group3": all_tokens[2*chunk:3*chunk],
+        "group4": all_tokens[3*chunk:],
+    }
+    self.usage["total_tokens"] += 100
+    return _json.dumps(groups)
 
-# build_embedding_cache should collect unique tokens and call embed()
-# Test sequential mode
-api_cache = build_embedding_cache(
-    samples, tokenizer, "all", mock_lm, "mock-embed-model",
-    embed_batch_size=10, parallel_workers=1,
-)
-assert len(api_cache) > 0, "Sequential API cache is empty"
-print(f"[OK] build_embedding_cache (sequential): {len(api_cache)} tokens")
+MockLMClass = type("MockLMCompletion", (), {
+    "__init__": _mock_lm_init,
+    "__call__": _mock_lm_call,
+})
 
-# Test parallel mode (workers=4, smaller batches to exercise multiple futures)
-api_cache = build_embedding_cache(
-    samples, tokenizer, "all", mock_lm, "mock-embed-model",
-    embed_batch_size=5, parallel_workers=4,
-)
-assert len(api_cache) > 0, "API cache is empty"
-first_vec = next(iter(api_cache.values()))
-assert len(first_vec) == HIDDEN_API, f"Expected dim {HIDDEN_API}, got {len(first_vec)}"
-print(f"[OK] build_embedding_cache: {len(api_cache)} unique tokens, dim={HIDDEN_API}")
-
-# embeddings_from_cache should reconstruct a tensor from the cache
-api_token_frequency = defaultdict(int)
-api_token_norms     = defaultdict(list)
-api_delta_ratios    = []
-
-for sample in samples:
-    text = extract_text(sample, "all")
-    if not text.strip():
-        continue
-    ids = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"]
-    emb = embeddings_from_cache(tokenizer, ids, api_cache)
-    if emb is None:
-        continue
-    assert emb.dim() == 3, "Expected (1, seq_len, hidden) tensor"
-    assert emb.shape[2] == HIDDEN_API
-    norms = compute_norms(emb)
-    accumulate_token_stats(tokenizer, ids, norms, api_token_frequency, api_token_norms)
-    delta, diam = get_delta(emb, max_points=200)
-    if diam > 0:
-        api_delta_ratios.append(2.0 * delta / diam)
-
-assert len(api_delta_ratios) > 0, "No delta values computed in API mode"
-assert all(0.0 <= d <= 1.0 for d in api_delta_ratios)
-print(f"[OK] embeddings_from_cache: {len(api_delta_ratios)} delta values, "
-      f"mean={np.mean(api_delta_ratios):.4f}")
+with _mock.patch.object(_ea, "LMCompletion", MockLMClass):
+    llm_groups = select_groups_via_llm(
+        token_frequency, "mock-llm-model", vocab_sample_k=50
+    )
+assert isinstance(llm_groups, dict), "select_groups_via_llm should return a dict"
+assert len(llm_groups) == 4, f"Expected 4 groups, got {len(llm_groups)}"
+llm_stats = compute_group_stats(llm_groups, token_frequency, token_norms)
+assert len(llm_stats) == 4
+print(f"[OK] select_groups_via_llm: {len(llm_groups)} groups, "
+      f"tokens covered: {sum(len(v) for v in llm_groups.values())}")
 
 print("\n=== All tests passed ===")
