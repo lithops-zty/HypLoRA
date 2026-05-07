@@ -47,10 +47,8 @@ Usage — API mode (OpenAI-compatible /v1/embeddings):
 """
 
 import argparse
-import hashlib
 import json
 import os
-import pickle
 import re
 import sys
 import csv
@@ -554,93 +552,6 @@ def _collect_unique_tokens(
     return sorted(unique_tokens)
 
 
-# ---------------------------------------------------------------------------
-# Embedding cache persistence (disk)
-# ---------------------------------------------------------------------------
-
-_CACHE_VERSION = 1  # bump when cache format changes
-
-
-def _cache_key(
-    embed_model: str,
-    base_model: str,
-    data_path: str,
-    text_field: str,
-    max_samples: int,
-) -> str:
-    """
-    Compute a short hex digest that uniquely identifies a cache file.
-
-    The key encodes the embedding model, tokenizer source, dataset file
-    (path + mtime + size), text field, and sample limit so that any change
-    to these inputs produces a different key and forces a fresh embedding run.
-    """
-    try:
-        stat = os.stat(data_path)
-        file_sig = f"{stat.st_mtime:.0f}:{stat.st_size}"
-    except OSError:
-        file_sig = "unknown"
-
-    raw = "|".join([
-        f"v{_CACHE_VERSION}",
-        embed_model,
-        os.path.basename(base_model.rstrip("/")),
-        os.path.abspath(data_path),
-        file_sig,
-        text_field,
-        str(max_samples),
-    ])
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-def load_embedding_cache(
-    cache_path: str,
-    expected_key: str,
-) -> dict[str, list[float]] | None:
-    """
-    Load an embedding cache from *cache_path* if it exists and its stored key
-    matches *expected_key*. Returns None on any mismatch or read error.
-
-    Cache file format (pickle):
-        {"key": str, "cache": dict[str, list[float]]}
-    """
-    if not os.path.isfile(cache_path):
-        return None
-    try:
-        with open(cache_path, "rb") as f:
-            data = pickle.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("Unexpected cache format (not a dict)")
-        if data.get("key") != expected_key:
-            print(f"  Cache key mismatch — ignoring stale cache at {cache_path}")
-            return None
-        cache = data["cache"]
-        print(f"  Loaded {len(cache)} embeddings from cache: {cache_path}")
-        return cache
-    except Exception as exc:
-        print(f"  WARNING: Could not load cache ({exc}). Will recompute.")
-        return None
-
-
-def save_embedding_cache(
-    cache: dict[str, list[float]],
-    cache_path: str,
-    key: str,
-) -> None:
-    """
-    Persist *cache* to *cache_path* as a pickle file tagged with *key*.
-    Creates parent directories as needed. Silently skips on write error.
-    """
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump({"key": key, "cache": cache}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        size_mb = os.path.getsize(cache_path) / 1024 / 1024
-        print(f"  Saved {len(cache)} embeddings to cache: {cache_path} ({size_mb:.1f} MB)")
-    except Exception as exc:
-        print(f"  WARNING: Could not save cache ({exc}).")
-
-
 def build_embedding_cache(
     samples: list[dict],
     tokenizer,
@@ -786,15 +697,6 @@ def main():
                              "If empty, falls back to hard-coded MEDICAL_GROUPS_FALLBACK.")
     parser.add_argument("--vocab_sample_k", default=600, type=int,
                         help="Number of tokens to sample for LLM group selection (default: 600)")
-    # -- Embedding disk cache ------------------------------------------------
-    parser.add_argument("--cache_path", default="",
-                        help="Path to a .pkl file for persisting the embedding cache to disk. "
-                             "On first run the cache is computed and saved; on subsequent runs "
-                             "it is loaded directly, skipping all API calls / GPU inference. "
-                             "The cache is keyed by (embed_model, base_model, data_path, "
-                             "text_field, max_samples) so stale caches are detected "
-                             "automatically. Works for both API mode and local model mode. "
-                             "If empty, no disk cache is used (default: empty).")
     args = parser.parse_args()
 
     if not args.api_mode and not args.base_model:
@@ -828,15 +730,6 @@ def main():
     print(f"Loading tokenizer from: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
 
-    # Compute cache key (used by both API and local modes when --cache_path is set)
-    cache_key = _cache_key(
-        embed_model=args.embed_model if args.api_mode else args.base_model,
-        base_model=args.base_model,
-        data_path=args.data_path,
-        text_field=args.text_field,
-        max_samples=args.max_samples,
-    ) if args.cache_path else ""
-
     # API mode: build embedding cache; skip model loading entirely
     if args.api_mode:
         print(f"API mode: embedding model = {args.embed_model}")
@@ -847,45 +740,23 @@ def main():
             log_mode="none",
             track_usage=True,
         )
-
-        # Try loading from disk cache first
-        embedding_cache = None
-        if args.cache_path:
-            print(f"Checking disk cache (key={cache_key}): {args.cache_path}")
-            embedding_cache = load_embedding_cache(args.cache_path, cache_key)
-
-        if embedding_cache is None:
-            embedding_cache = build_embedding_cache(
-                samples, tokenizer, args.text_field, lm, args.embed_model,
-                args.embed_batch_size, args.parallel_workers,
-            )
-            if args.cache_path:
-                save_embedding_cache(embedding_cache, args.cache_path, cache_key)
-
+        embedding_cache = build_embedding_cache(
+            samples, tokenizer, args.text_field, lm, args.embed_model,
+            args.embed_batch_size, args.parallel_workers,
+        )
         model = None
         device = "cpu"
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading model from: {args.base_model}  (device={device})")
-
-        # Try loading from disk cache first (avoids GPU model loading entirely)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            torch_dtype=torch.float16,
+            device_map={"":  int(os.environ.get("LOCAL_RANK") or 0)} if device == "cuda" else "cpu",
+            trust_remote_code=True,
+        )
+        model.eval()
         embedding_cache = None
-        if args.cache_path:
-            print(f"Checking disk cache (key={cache_key}): {args.cache_path}")
-            embedding_cache = load_embedding_cache(args.cache_path, cache_key)
-
-        if embedding_cache is not None:
-            # Cache hit: skip model loading
-            print("  Cache hit — skipping model load and GPU inference.")
-            model = None
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.base_model,
-                torch_dtype=torch.float16,
-                device_map={"":  int(os.environ.get("LOCAL_RANK") or 0)} if device == "cuda" else "cpu",
-                trust_remote_code=True,
-            )
-            model.eval()
 
     run_table1 = args.tables in ("1", "all")
     run_table2 = args.tables in ("2", "all")
@@ -896,19 +767,6 @@ def main():
     token_frequency: dict[str, int]        = defaultdict(int)
     token_norms:     dict[str, list[float]] = defaultdict(list)
     delta_ratios:    list[float]            = []
-
-    # Accumulator for per-token mean embedding vectors (local mode only).
-    # Used to build a disk cache after the main loop so subsequent runs can
-    # skip GPU inference entirely.  Only populated when --cache_path is set
-    # and no cache was loaded from disk.
-    _need_local_cache = (
-        not args.api_mode
-        and bool(args.cache_path)
-        and embedding_cache is None
-        and model is not None
-    )
-    # {token_str: (sum_vector: np.ndarray, count: int)}
-    _local_embed_sum: dict[str, tuple[np.ndarray, int]] = {}
 
     skip_delta_msg = "" if run_table2 else " (delta skipped: --tables=1)"
     print(f"\nAnalysing {len(samples)} samples (text_field='{args.text_field}'){skip_delta_msg}...")
@@ -923,33 +781,14 @@ def main():
             truncation=False,
         )["input_ids"]  # keep on CPU; moved to device below if needed
 
-        if args.api_mode or embedding_cache is not None:
-            # API mode, or local mode with a cache hit
+        if args.api_mode:
             embeddings = embeddings_from_cache(tokenizer, input_ids, embedding_cache)
             if embeddings is None:
                 continue
         else:
-            # Local mode without cache: run GPU inference
             input_ids = input_ids.to(device)
             with torch.no_grad():
                 embeddings = model.get_input_embeddings()(input_ids)  # (1, seq_len, hidden)
-
-            # Accumulate per-token mean vectors for disk cache
-            if _need_local_cache:
-                tokens = tokenizer.convert_ids_to_tokens(
-                    input_ids.squeeze(0).cpu().numpy()
-                )
-                emb_np = embeddings.squeeze(0).float().cpu().numpy()  # (seq_len, hidden)
-                for i, t in enumerate(tokens):
-                    cleaned = clean_token(t)
-                    if not cleaned:
-                        continue
-                    vec = emb_np[i]  # (hidden,)
-                    if cleaned in _local_embed_sum:
-                        prev_sum, prev_cnt = _local_embed_sum[cleaned]
-                        _local_embed_sum[cleaned] = (prev_sum + vec, prev_cnt + 1)
-                    else:
-                        _local_embed_sum[cleaned] = (vec.copy(), 1)
 
         # Table 1: accumulate token statistics (always needed for CSV/JSON)
         norms = compute_norms(embeddings)
@@ -964,14 +803,6 @@ def main():
     # Print API usage summary if applicable
     if args.api_mode and lm.usage:
         print(f"\nAPI usage: {lm.usage['total_tokens']} total tokens")
-
-    # Save local-model embedding cache after inference (if requested and not already loaded)
-    if _need_local_cache and _local_embed_sum:
-        local_cache = {
-            token: (vec_sum / count).tolist()
-            for token, (vec_sum, count) in _local_embed_sum.items()
-        }
-        save_embedding_cache(local_cache, args.cache_path, cache_key)
 
     # ------------------------------------------------------------------
     # Table 1: group statistics
