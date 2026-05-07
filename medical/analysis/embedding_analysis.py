@@ -76,39 +76,163 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Medical-domain token groups (Table 1 equivalent)
 # ---------------------------------------------------------------------------
-# Words are selected from the MIMIC-IV val set to cover a frequency spectrum
-# that mirrors the four groups in the original HypLoRA paper:
-#   Group 1 – high-frequency function words  (freq > 100 in val)
-#   Group 2 – common clinical/EHR terms      (freq 50–10000)
-#   Group 3 – general laboratory concepts    (freq 20–1000)
-#   Group 4 – specific drug / rare lab names (freq < 30)
-MEDICAL_GROUPS = {
+# Groups are selected at runtime by an LLM from a stratified random sample of
+# the actual tokenizer vocabulary observed in the dataset.  The hard-coded
+# fallback below is used only when --group_llm_model is not provided.
+MEDICAL_GROUPS_FALLBACK = {
     "Group 1 (function words)": [
-        # Freq in val: the=145, of=347, and=170, to=135, for=134, by=133, with=57
         "the", "of", "and", "to", "for", "by", "with", "is", "are", "been",
     ],
     "Group 2 (clinical common)": [
-        # Freq in val: blood=10891, mg=1395, insulin=1209, sodium=849,
-        # hematocrit=602, glucose=588, chloride=516, administered=5239
         "blood", "mg", "insulin", "sodium", "hematocrit",
         "glucose", "chloride", "administered", "laboratory", "emar",
     ],
     "Group 3 (general medical)": [
-        # Freq in val: phosphate=218, fibrinogen=217, hemoglobin=142,
-        # calcium=132, bicarbonate=123, magnesium=122, platelet=121,
-        # bilirubin=82, potassium=48, albumin=38
         "phosphate", "hemoglobin", "calcium", "bicarbonate",
         "magnesium", "platelet", "bilirubin", "potassium", "albumin",
     ],
     "Group 4 (specific clinical)": [
-        # Freq in val: aripiprazole=582(*), phytonadione=136, fibrinogen=217(*),
-        # enoxaparin=26, creatinine=27, furosemide=13, gabapentin=14,
-        # prednisone=6, budesonide=10
-        # (*) higher than expected due to small val size; full dataset will differ
         "phytonadione", "enoxaparin", "creatinine", "furosemide",
         "gabapentin", "prednisone", "budesonide", "tramadol", "loratadine",
     ],
 }
+
+
+_GROUP_SYSTEM_PROMPT = """\
+You are a medical NLP expert. You will be given a list of tokens extracted from \
+a BPE tokenizer applied to MIMIC-IV clinical EHR notes. The tokens have been \
+cleaned (BPE prefix symbols removed, lowercased), so some may be subword \
+fragments rather than complete words.
+
+Your task is to select tokens for four groups based on clinical specificity:
+
+- Group 1 (Function words): Common non-medical function words (articles, \
+prepositions, conjunctions, auxiliaries). E.g., "the", "of", "is", "with".
+- Group 2 (Clinical common): General clinical terms understandable to \
+non-specialists. E.g., "blood", "mg", "glucose", "administered".
+- Group 3 (General medical): Standard medical terminology requiring basic \
+medical training. E.g., "hemoglobin", "platelet", "bilirubin", "creatinine".
+- Group 4 (Specific clinical): Highly specialized terms — rare drug names, \
+specific lab assays, or complex procedures unfamiliar to non-specialists. \
+E.g., "phytonadione", "enoxaparin", "esophagogastroduodenoscopy".
+
+Rules:
+1. Prefer tokens that are semantically complete words. Avoid selecting tokens \
+that are clearly subword fragments (e.g., single syllables like "ine", "tion", \
+"ing" that carry no standalone meaning).
+2. Select exactly 20 tokens per group.
+3. Each token must come from the provided list.
+4. No token may appear in more than one group.
+5. Return ONLY a valid JSON object with keys "group1", "group2", "group3", \
+"group4", each a list of exactly 20 strings. No explanation or markdown.
+"""
+
+
+def _stratified_sample(
+    token_frequency: dict[str, int],
+    sample_k: int,
+    seed: int = 42,
+) -> dict[str, int]:
+    """
+    Draw a stratified random sample from token_frequency.
+
+    Tokens are split into three frequency bands:
+      - High  : freq > 500
+      - Mid   : freq 21–500
+      - Low   : freq <= 20
+
+    Each band contributes sample_k // 3 tokens (remainder goes to mid).
+    All tokens in a band are included if the band is smaller than its quota.
+    """
+    rng = np.random.default_rng(seed)
+    high = {t: f for t, f in token_frequency.items() if f > 500}
+    mid  = {t: f for t, f in token_frequency.items() if 21 <= f <= 500}
+    low  = {t: f for t, f in token_frequency.items() if f <= 20}
+
+    per_band = sample_k // 3
+
+    def _sample_band(band: dict, n: int) -> dict:
+        keys = list(band.keys())
+        chosen = rng.choice(keys, size=min(n, len(keys)), replace=False)
+        return {k: band[k] for k in chosen}
+
+    sampled = {}
+    sampled.update(_sample_band(high, per_band))
+    sampled.update(_sample_band(mid,  per_band + (sample_k % 3)))  # remainder to mid
+    sampled.update(_sample_band(low,  per_band))
+    return sampled
+
+
+def select_groups_via_llm(
+    token_frequency: dict[str, int],
+    lm: "LMCompletion",
+    group_llm_model: str,
+    vocab_sample_k: int = 600,
+) -> dict[str, list[str]]:
+    """
+    Ask an LLM to select 20 representative tokens per group from a stratified
+    random sample of the observed tokenizer vocabulary.
+
+    Returns a dict with keys matching MEDICAL_GROUPS_FALLBACK:
+      "Group 1 (function words)", "Group 2 (clinical common)",
+      "Group 3 (general medical)", "Group 4 (specific clinical)"
+
+    Falls back to MEDICAL_GROUPS_FALLBACK on any error.
+    """
+    print(f"Selecting Table 1 token groups via LLM ({group_llm_model})...")
+
+    # Build stratified sample and format as compact JSON for the prompt
+    sample = _stratified_sample(token_frequency, vocab_sample_k)
+    # Sort by frequency descending for readability
+    sample_sorted = dict(sorted(sample.items(), key=lambda x: -x[1]))
+    token_list_str = json.dumps(sample_sorted, ensure_ascii=False)
+
+    user_prompt = (
+        f"Token list (token: frequency in dataset):\n{token_list_str}\n\n"
+        "Select exactly 20 tokens per group."
+    )
+
+    # Use a fresh LMCompletion instance with the grouping model to avoid
+    # polluting the conversation history of the embedding LM instance.
+    grouping_lm = LMCompletion(
+        model=group_llm_model,
+        api_key=lm.api_key,
+        request_url=lm.request_url,
+        log_mode="none",
+        track_usage=True,
+    )
+
+    try:
+        grouping_lm(_GROUP_SYSTEM_PROMPT, role="system", temperature=0.0)
+        raw = grouping_lm(user_prompt, temperature=0.0)
+
+        # Strip optional markdown code fences
+        raw = re.sub(r'^```(?:json)?\s*', '', raw.strip())
+        raw = re.sub(r'\s*```$', '', raw.strip())
+        parsed = json.loads(raw)
+
+        groups = {
+            "Group 1 (function words)":  parsed["group1"],
+            "Group 2 (clinical common)": parsed["group2"],
+            "Group 3 (general medical)": parsed["group3"],
+            "Group 4 (specific clinical)": parsed["group4"],
+        }
+
+        # Validate: each group must be a non-empty list of strings
+        for name, tokens in groups.items():
+            if not isinstance(tokens, list) or not tokens:
+                raise ValueError(f"{name} returned empty or non-list: {tokens}")
+
+        total_tokens = sum(len(v) for v in groups.values())
+        if grouping_lm.usage:
+            print(f"  LLM grouping API usage: {grouping_lm.usage['total_tokens']} tokens")
+        print(f"  Groups selected: {', '.join(f'{k}({len(v)})' for k, v in groups.items())}")
+        return groups
+
+    except Exception as exc:
+        print(f"  WARNING: LLM group selection failed ({exc}). "
+              "Falling back to hard-coded MEDICAL_GROUPS_FALLBACK.")
+        return MEDICAL_GROUPS_FALLBACK
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -566,6 +690,13 @@ def main():
                              "'2' = delta-hyperbolicity only, 'all' = both (default: all). "
                              "Selecting '1' skips the O(n^3) delta computation; "
                              "selecting '2' still collects token stats but skips Table 1 output.")
+    # -- Table 1 LLM grouping ------------------------------------------------
+    parser.add_argument("--group_llm_model", default="",
+                        help="LLM model for Table 1 token group selection via API. "
+                             "Uses same api_base/api_key as embedding mode. "
+                             "If empty, falls back to hard-coded MEDICAL_GROUPS_FALLBACK.")
+    parser.add_argument("--vocab_sample_k", default=600, type=int,
+                        help="Number of tokens to sample for LLM group selection (default: 600)")
     args = parser.parse_args()
 
     if not args.api_mode and not args.base_model:
@@ -676,9 +807,21 @@ def main():
     # ------------------------------------------------------------------
     # Table 1: group statistics
     # ------------------------------------------------------------------
-    group_stats = compute_group_stats(MEDICAL_GROUPS, token_frequency, token_norms)
     if run_table1:
+        if args.group_llm_model and args.api_mode and lm is not None:
+            medical_groups = select_groups_via_llm(
+                token_frequency, lm, args.group_llm_model, args.vocab_sample_k
+            )
+        else:
+            if args.group_llm_model and not args.api_mode:
+                print("WARNING: --group_llm_model requires --api_mode. "
+                      "Falling back to MEDICAL_GROUPS_FALLBACK.")
+            medical_groups = MEDICAL_GROUPS_FALLBACK
+        group_stats = compute_group_stats(medical_groups, token_frequency, token_norms)
         print_table1(group_stats, model_name)
+    else:
+        medical_groups = MEDICAL_GROUPS_FALLBACK
+        group_stats = compute_group_stats(medical_groups, token_frequency, token_norms)
 
     # ------------------------------------------------------------------
     # Table 2: delta-hyperbolicity summary

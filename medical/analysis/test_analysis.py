@@ -19,7 +19,7 @@ from medical.analysis.embedding_analysis import (
     delta_hyp,
     get_delta,
     compute_group_stats,
-    MEDICAL_GROUPS,
+    MEDICAL_GROUPS_FALLBACK,
     print_table1,
     print_table2,
     plot_frequency_vs_norm,
@@ -51,10 +51,10 @@ class MockTokenizer:
         ids = torch.randint(0, 32000, (1, n))
         return {"input_ids": ids}
     def convert_ids_to_tokens(self, ids):
-        vocab = list(MEDICAL_GROUPS["Group 1 (function words)"]) + \
-                list(MEDICAL_GROUPS["Group 2 (clinical common)"]) + \
-                list(MEDICAL_GROUPS["Group 3 (general medical)"]) + \
-                list(MEDICAL_GROUPS["Group 4 (specific clinical)"]) + \
+        vocab = list(MEDICAL_GROUPS_FALLBACK["Group 1 (function words)"]) + \
+                list(MEDICAL_GROUPS_FALLBACK["Group 2 (clinical common)"]) + \
+                list(MEDICAL_GROUPS_FALLBACK["Group 3 (general medical)"]) + \
+                list(MEDICAL_GROUPS_FALLBACK["Group 4 (specific clinical)"]) + \
                 ["xyz", "abc", "123"]
         return [vocab[i % len(vocab)] for i in ids]
 
@@ -82,7 +82,7 @@ print(f"     Unique tokens: {len(token_frequency)}")
 print(f"     Delta samples: {len(delta_ratios)}")
 
 # ── 4. Group stats ───────────────────────────────────────────────────────────
-group_stats = compute_group_stats(MEDICAL_GROUPS, token_frequency, token_norms)
+group_stats = compute_group_stats(MEDICAL_GROUPS_FALLBACK, token_frequency, token_norms)
 found_any = any(len(s["tokens_found"]) > 0 for s in group_stats.values())
 assert found_any, "No tokens found in any group — mock tokenizer may be broken"
 print_table1(group_stats, "MockModel")
