@@ -28,6 +28,9 @@ from medical.analysis.embedding_analysis import (
     save_results_json,
     build_embedding_cache,
     embeddings_from_cache,
+    load_embedding_cache,
+    save_embedding_cache,
+    _cache_key,
 )
 from collections import defaultdict
 
@@ -176,5 +179,41 @@ assert len(api_delta_ratios) > 0, "No delta values computed in API mode"
 assert all(0.0 <= d <= 1.0 for d in api_delta_ratios)
 print(f"[OK] embeddings_from_cache: {len(api_delta_ratios)} delta values, "
       f"mean={np.mean(api_delta_ratios):.4f}")
+
+# ── 8. Disk cache persistence ────────────────────────────────────────────────
+print("\n--- Testing disk cache persistence ---")
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    cache_file = os.path.join(tmpdir, "embed_cache.pkl")
+    test_key = "deadbeef12345678"
+
+    # 8a. Save and reload
+    save_embedding_cache(api_cache, cache_file, test_key)
+    assert os.path.isfile(cache_file), "Cache file was not created"
+    loaded = load_embedding_cache(cache_file, test_key)
+    assert loaded is not None, "load_embedding_cache returned None on valid cache"
+    assert set(loaded.keys()) == set(api_cache.keys()), "Cache keys mismatch after round-trip"
+    for tok in api_cache:
+        assert loaded[tok] == api_cache[tok], f"Vector mismatch for token '{tok}'"
+    print(f"[OK] Cache save/load round-trip: {len(loaded)} tokens")
+
+    # 8b. Stale key detection
+    stale = load_embedding_cache(cache_file, "wrongkey0000")
+    assert stale is None, "Expected None for stale cache key"
+    print("[OK] Stale cache key correctly rejected")
+
+    # 8c. Missing file returns None
+    missing = load_embedding_cache(os.path.join(tmpdir, "nonexistent.pkl"), test_key)
+    assert missing is None, "Expected None for missing cache file"
+    print("[OK] Missing cache file returns None")
+
+    # 8d. _cache_key produces different digests for different inputs
+    k1 = _cache_key("model-a", "base-x", "/data/val.jsonl", "all", 0)
+    k2 = _cache_key("model-b", "base-x", "/data/val.jsonl", "all", 0)
+    k3 = _cache_key("model-a", "base-x", "/data/val.jsonl", "user", 0)
+    assert k1 != k2, "Different embed_model should produce different cache keys"
+    assert k1 != k3, "Different text_field should produce different cache keys"
+    assert len(k1) == 16, f"Expected 16-char hex key, got {len(k1)}"
+    print(f"[OK] _cache_key: k1={k1}, k2={k2}, k3={k3}")
 
 print("\n=== All tests passed ===")
