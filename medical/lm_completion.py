@@ -14,6 +14,7 @@ class LMCompletion:
                  request_url: str = None,
                  timeout: int = 200,
                  log_mode: str = "file",
+                 log_dir: str = ".",
                  track_usage: bool = True):
         """
         Language Model Completion wrapper for OpenAI-compatible APIs.
@@ -24,11 +25,13 @@ class LMCompletion:
             request_url: Base URL for the API
             timeout: Request timeout in seconds
             log_mode: Logging behavior - "none", "terminal", "file", or "both"
+            log_dir: Directory to write log files (only used when log_mode is "file" or "both")
         """
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.request_url = request_url or os.getenv("OPENAI_BASE_URL")
         self.log_mode = log_mode.lower()
+        self.log_dir = log_dir
         self.usage = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -56,7 +59,8 @@ class LMCompletion:
     def _setup_file_logging(self):
         """Setup file logging (独立 logger + FileHandler)."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_file = f"lm_completion_{timestamp}.log"
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_file = os.path.join(self.log_dir, f"lm_completion_{timestamp}.log")
 
         # 每个实例单独 logger，避免和全局 logging 混在一起
         self.logger = logging.getLogger(f"LMCompletion-{self.model}-{timestamp}")
