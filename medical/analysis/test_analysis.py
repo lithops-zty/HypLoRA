@@ -144,6 +144,7 @@ MockLMClass = type("MockLMCompletion", (), {
     "__call__": _mock_lm_call,
 })
 
+# 7a. Normal case: LLM returns valid in-vocab tokens
 with _mock.patch.object(_ea, "LMCompletion", MockLMClass):
     llm_groups = select_groups_via_llm(
         token_frequency, "mock-llm-model", vocab_sample_k=50
@@ -152,7 +153,46 @@ assert isinstance(llm_groups, dict), "select_groups_via_llm should return a dict
 assert len(llm_groups) == 4, f"Expected 4 groups, got {len(llm_groups)}"
 llm_stats = compute_group_stats(llm_groups, token_frequency, token_norms)
 assert len(llm_stats) == 4
-print(f"[OK] select_groups_via_llm: {len(llm_groups)} groups, "
+print(f"[OK] 7a select_groups_via_llm (normal): {len(llm_groups)} groups, "
       f"tokens covered: {sum(len(v) for v in llm_groups.values())}")
+
+# 7b. OOV filter + backfill: LLM returns mostly out-of-vocab tokens
+#     Expect post-filter to remove OOV entries and backfill from token_frequency
+def _mock_lm_call_oov(self, prompt, role="user", temperature=1.0, **kwargs):
+    if role == "system":
+        return ""
+    # Return 20 OOV tokens per group (not in token_frequency)
+    oov = [f"oov_token_{i}" for i in range(80)]
+    groups_oov = {
+        "group1": oov[0:20],
+        "group2": oov[20:40],
+        "group3": oov[40:60],
+        "group4": oov[60:80],
+    }
+    self.usage["total_tokens"] += 100
+    return _json.dumps(groups_oov)
+
+MockLMClassOOV = type("MockLMCompletionOOV", (), {
+    "__init__": _mock_lm_init,
+    "__call__": _mock_lm_call_oov,
+})
+
+with _mock.patch.object(_ea, "LMCompletion", MockLMClassOOV):
+    llm_groups_oov = select_groups_via_llm(
+        token_frequency, "mock-llm-model", vocab_sample_k=50
+    )
+
+# All returned tokens must be in token_frequency
+for gname, gtokens in llm_groups_oov.items():
+    bad = [t for t in gtokens if t not in token_frequency]
+    assert not bad, f"{gname} still contains OOV tokens after backfill: {bad}"
+
+# No token should appear in more than one group
+all_assigned_oov = [t for g in llm_groups_oov.values() for t in g]
+assert len(all_assigned_oov) == len(set(all_assigned_oov)), \
+    "Duplicate tokens across groups after backfill"
+
+print(f"[OK] 7b OOV filter + backfill: all tokens in-vocab, no duplicates")
+print(f"     Group sizes: {', '.join(f'{k}({len(v)})' for k, v in llm_groups_oov.items())}")
 
 print("\n=== All tests passed ===")
