@@ -126,6 +126,8 @@ def _stratified_sample(
     """
     Draw a stratified random sample from token_frequency.
 
+    sample_k=0 returns the full vocabulary (no sampling).
+
     Tokens are split into three frequency bands:
       - High  : freq > 500
       - Mid   : freq 21–500
@@ -134,6 +136,9 @@ def _stratified_sample(
     Each band contributes sample_k // 3 tokens (remainder goes to mid).
     All tokens in a band are included if the band is smaller than its quota.
     """
+    if sample_k == 0:
+        return {str(k): v for k, v in token_frequency.items()}
+
     rng = np.random.default_rng(seed)
     high = {t: f for t, f in token_frequency.items() if f > 500}
     mid  = {t: f for t, f in token_frequency.items() if 21 <= f <= 500}
@@ -201,60 +206,12 @@ def select_groups_via_llm(
         parsed = json.loads(raw)
 
         groups = {
-            "Group 1 (function words)":  parsed["group1"],
-            "Group 2 (clinical common)": parsed["group2"],
-            "Group 3 (general medical)": parsed["group3"],
+            "Group 1 (function words)":    parsed["group1"],
+            "Group 2 (clinical common)":   parsed["group2"],
+            "Group 3 (general medical)":   parsed["group3"],
             "Group 4 (specific clinical)": parsed["group4"],
         }
 
-        # Validate: each group must be a non-empty list of strings
-        for name, tokens in groups.items():
-            if not isinstance(tokens, list) or not tokens:
-                raise ValueError(f"{name} returned empty or non-list: {tokens}")
-
-        # Post-filter: remove tokens not in the observed vocabulary, then
-        # backfill from same-frequency-band candidates up to target_size.
-        target_size = 20
-        all_assigned: set[str] = set()
-        filtered: dict[str, list[str]] = {}
-        for name, tokens in groups.items():
-            valid = [t.lower() for t in tokens if t.lower() in token_frequency]
-            filtered[name] = valid
-            all_assigned.update(valid)
-
-        # Build per-band candidate pools (excluding already-assigned tokens)
-        def _band_pool(lo: int, hi: int) -> list[str]:
-            return sorted(
-                [t for t, f in token_frequency.items()
-                 if lo <= f <= hi and t not in all_assigned],
-                key=lambda t: -token_frequency[t],
-            )
-
-        band_pools = [
-            _band_pool(501, 10**9),   # high
-            _band_pool(21, 500),      # mid
-            _band_pool(0, 20),        # low
-        ]
-
-        for name, valid in filtered.items():
-            deficit = target_size - len(valid)
-            if deficit > 0:
-                for pool in band_pools:
-                    while deficit > 0 and pool:
-                        cand = pool.pop(0)
-                        if cand not in all_assigned:
-                            valid.append(cand)
-                            all_assigned.add(cand)
-                            deficit -= 1
-            groups[name] = valid
-
-        # Report
-        oov_total = sum(
-            len([t for t in parsed[f'group{i+1}'] if t.lower() not in token_frequency])
-            for i in range(4)
-        )
-        if oov_total:
-            print(f"  Post-filter: removed {oov_total} out-of-vocab tokens, backfilled from dataset")
         if grouping_lm.usage:
             print(f"  LLM grouping API usage: {grouping_lm.usage['total_tokens']} tokens")
         print(f"  Groups selected: {', '.join(f'{k}({len(v)})' for k, v in groups.items())}")
