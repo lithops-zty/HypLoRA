@@ -164,6 +164,7 @@ def select_groups_via_llm(
     vocab_sample_k: int = 600,
     api_key: str = "",
     api_base: str = "",
+    log_dir: str = ".",
 ) -> dict[str, list[str]]:
     """
     Ask an LLM to select 20 representative tokens per group from a stratified
@@ -192,7 +193,8 @@ def select_groups_via_llm(
         model=group_llm_model,
         api_key=api_key or None,
         request_url=api_base or None,
-        log_mode="none",
+        log_mode="file",
+        log_dir=log_dir,
         track_usage=True,
     )
 
@@ -642,6 +644,7 @@ def main():
                 vocab_sample_k=args.vocab_sample_k,
                 api_key=args.api_key,
                 api_base=args.api_base,
+                log_dir=args.output_dir,
             )
         else:
             medical_groups = MEDICAL_GROUPS_FALLBACK

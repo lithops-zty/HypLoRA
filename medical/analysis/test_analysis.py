@@ -117,7 +117,7 @@ import json as _json
 import unittest.mock as _mock
 
 def _mock_lm_init(self, model=None, api_key=None, request_url=None,
-                  log_mode="none", track_usage=False):
+                  log_mode="none", log_dir=".", track_usage=False):
     self.model = model
     self.usage = {"prompt_tokens": 0, "total_tokens": 0}
     self._history = []
