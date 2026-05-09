@@ -99,9 +99,14 @@ class LMCompletion:
                  max_tokens: Optional[int] = None,
                  temperature: float = 0.1,
                  role="user",
+                 no_reply: bool = False,
                  **kwargs) -> str:
         """
         Generate completion for the given prompt.
+
+        Args:
+            no_reply: If True, append the message to history and log it, but do
+                      not send a request to the LLM. Returns an empty string.
         """
         # Generate UUID to visually match prompt and response in logs
         if role not in ['system', 'user']:
@@ -123,6 +128,9 @@ PROMPT <{self.model}>:
 {"":<^100}
 """)
         self.messages.append({"role": role, "content": data})
+
+        if no_reply:
+            return ""
 
         try:
             response = self.openai_client.chat.completions.create(

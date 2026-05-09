@@ -198,7 +198,7 @@ def select_groups_via_llm(
     )
 
     try:
-        grouping_lm(_GROUP_SYSTEM_PROMPT, role="system", temperature=0.0)
+        grouping_lm(_GROUP_SYSTEM_PROMPT, role="system", temperature=0.0, no_reply=True)
         raw = grouping_lm(user_prompt, temperature=0.0)
 
         # Strip optional markdown code fences
