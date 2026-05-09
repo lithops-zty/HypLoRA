@@ -178,14 +178,13 @@ def select_groups_via_llm(
     """
     print(f"Selecting Table 1 token groups via LLM ({group_llm_model})...")
 
-    # Build stratified sample and format as compact JSON for the prompt
+    # Build stratified sample; pass only token strings (no frequencies) to the LLM
     sample = _stratified_sample(token_frequency, vocab_sample_k)
-    # Sort by frequency descending for readability
-    sample_sorted = dict(sorted(sample.items(), key=lambda x: -x[1]))
-    token_list_str = json.dumps(sample_sorted, ensure_ascii=False)
+    tokens_sorted = sorted(sample.keys(), key=lambda t: -sample[t])  # high-freq first
+    token_list_str = json.dumps(tokens_sorted, ensure_ascii=False)
 
     user_prompt = (
-        f"Token list (token: frequency in dataset):\n{token_list_str}\n\n"
+        f"Token list:\n{token_list_str}\n\n"
         "Select exactly 20 tokens per group."
     )
 
